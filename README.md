@@ -1,5 +1,10 @@
 # file-brief
 
+[![npm version](https://img.shields.io/npm/v/file-brief)](https://www.npmjs.com/package/file-brief)
+[![npm downloads](https://img.shields.io/npm/dm/file-brief)](https://www.npmjs.com/package/file-brief)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/Zhiyi-Zhao/file-brief/actions/workflows/validate.yml/badge.svg)](https://github.com/Zhiyi-Zhao/file-brief/actions/workflows/validate.yml)
+
 [中文](#中文) · [English](#english)
 
 `file-brief` is an agent-agnostic skill (OpenAI Codex · Claude Code · DeepSeek Harness) that turns repeated input-file inspection into reusable, task-local documentation.
@@ -62,6 +67,16 @@ Copy-Item -LiteralPath ".\skills\file-brief" -Destination "$HOME\.dsh\skills\fil
 # macOS/Linux：Claude Code
 mkdir -p ~/.claude/skills && cp -R skills/file-brief ~/.claude/skills/
 ```
+
+**npm 安装（DeepSeek Harness 插件方式）**：`file-brief@2.0.0` 已发布到 npm（声明 `dsh.bundle`），可以作为 DSH 插件安装，也可在 [deepseek1024.com](https://deepseek1024.com/) 插件商店详情页获得一键安装命令：
+
+```bash
+dsh plugin --profile web add file-brief
+# 或
+npx @deepseek-ai/dsh plugin --profile web add file-brief
+```
+
+> 说明：作为 npm 插件安装时，bundle 的 patch 层是空操作（技能本体通过 SKILL.md 加载）；仍建议把技能复制到 `~/.dsh/skills` 等技能根目录以获得最佳体验。
 
 安装后请启动一个新的 Agent 会话，使技能列表重新加载。
 
@@ -362,6 +377,16 @@ Manual copy also works:
 # macOS/Linux: Claude Code
 mkdir -p ~/.claude/skills && cp -R skills/file-brief ~/.claude/skills/
 ```
+
+**Install from npm (DeepSeek Harness plugin style)**: `file-brief@2.0.0` is published to npm with a `dsh.bundle` declaration, so it can be installed as a DSH plugin, and the [deepseek1024.com](https://deepseek1024.com/) store shows a one-click install command on its plugin page:
+
+```bash
+dsh plugin --profile web add file-brief
+# or
+npx @deepseek-ai/dsh plugin --profile web add file-brief
+```
+
+> Note: installed as an npm plugin, the bundle's patch layer is a no-op (the skill itself loads through SKILL.md); copying the skill into `~/.dsh/skills` or another skill root still gives the best experience.
 
 Start a new agent session after installation so the skill list reloads.
 
