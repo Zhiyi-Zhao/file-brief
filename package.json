@@ -1,0 +1,24 @@
+{
+  "name": "codex-catalog-input-files",
+  "version": "2.0.0",
+  "description": "Agent-agnostic skill that catalogs task input files into reusable structural explanations and a per-task searchable index (OpenAI Codex, Claude Code, DeepSeek Harness)",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "skill",
+    "codex",
+    "claude-code",
+    "file-catalog",
+    "data-analysis"
+  ],
+  "files": [
+    "skills/"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

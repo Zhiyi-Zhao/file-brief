@@ -1,0 +1,9 @@
+# catalog-input-files is a skill-type plugin: its functionality ships as a
+# SKILL.md bundle that agents load from a skill root (~/.dsh/skills,
+# ~/.agents/skills, ~/.claude/skills, or a Codex skills directory).
+#
+# The bundle patch layer is therefore intentionally empty: enabling this
+# bundle must not alter the profile's plugin rows. Install the skill itself
+# with install.ps1 / install.sh or by copying skills/catalog-input-files into
+# a skill root.
+[]
