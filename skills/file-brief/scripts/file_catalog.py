@@ -1531,7 +1531,11 @@ def analyze_stata(path: Path) -> Analysis:
         frame = reader.get_chunk(TABLE_SAMPLE_ROWS)
         variable_count = len(frame.columns)
     finally:
-        reader.close()
+        # pandas 3.0 removed StataReader.close (pandas-dev/pandas#49228);
+        # keep the call defensive for older releases.
+        close = getattr(reader, "close", None)
+        if callable(close):
+            close()
     language = detect_language(" ".join(clean_structural_name(x) for x in frame.columns))
     structure = {
         "sample_rows": int(len(frame)),
