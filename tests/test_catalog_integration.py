@@ -59,6 +59,7 @@ SKILL_ROOT = REPOSITORY_ROOT / "skills" / "catalog-input-files"
 CATALOG_SCRIPT = SKILL_ROOT / "scripts" / "file_catalog.py"
 R_HELPER = SKILL_ROOT / "scripts" / "inspect_r_data.R"
 SECRET = "PRIVATE_" + "UNIQUE_VALUE_" + "94817"
+NEW_SECRET = "PRIVATE_" + "NEW_FORMATS_" + "7702"
 R_SECRET = "PRIVATE_" + "R_VALUE"
 
 
@@ -171,6 +172,72 @@ def make_common_fixtures(root: Path) -> list[Path]:
         archive.writestr("word/document.xml", document_xml)
         archive.writestr("word/media/image1.bin", b"media")
 
+    sqlite_path = root / "database.db"
+    connection = sqlite3.connect(sqlite_path)
+    try:
+        connection.execute(
+            "CREATE TABLE measurements (id INTEGER PRIMARY KEY, label TEXT, value REAL)"
+        )
+        connection.execute(
+            "INSERT INTO measurements VALUES (1, ?, 2.5)", (NEW_SECRET,)
+        )
+        connection.execute(
+            "CREATE VIEW measurement_view AS SELECT id FROM measurements"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    zip_path = root / "bundle.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("data/inner.txt", f"content {NEW_SECRET}")
+
+    xml_path = root / "structure.xml"
+    xml_path.write_text(
+        '<?xml version="1.0"?><root xmlns:a="urn:x"><item id="1"/><item id="2"/></root>',
+        encoding="utf-8",
+    )
+
+    html_path = root / "site.html"
+    html_path.write_text(
+        f"<html><head><title>T</title></head><body><h1>Hi</h1><p>{NEW_SECRET}</p>"
+        "<table><tr><td>1</td></tr></table></body></html>",
+        encoding="utf-8",
+    )
+
+    notebook_path = root / "notebook.ipynb"
+    notebook_path.write_text(
+        json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "execution_count": 1,
+                        "source": [f"print('{NEW_SECRET}')"],
+                    },
+                    {"cell_type": "markdown", "source": ["# doc"]},
+                ],
+                "metadata": {"kernelspec": {"name": "python3", "language": "python"}},
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    semi_path = root / "semi.csv"
+    semi_path.write_text("a;b;c\n1;x;true\n2;y;false\n", encoding="utf-8")
+
+    go_path = root / "server.go"
+    go_path.write_text(
+        'package main\nimport "fmt"\n'
+        "func main() { fmt.Println(1) }\ntype Server struct{}\n",
+        encoding="utf-8",
+    )
+
+    dta_path = root / "dataset.dta"
+    frame[["abundance"]].to_stata(dta_path, write_index=False)
+
     return [
         csv_path,
         duplicate_csv,
@@ -185,6 +252,14 @@ def make_common_fixtures(root: Path) -> list[Path]:
         image_path,
         binary_path,
         docx_path,
+        sqlite_path,
+        zip_path,
+        xml_path,
+        html_path,
+        notebook_path,
+        semi_path,
+        go_path,
+        dta_path,
     ]
 
 
@@ -216,6 +291,8 @@ def test_catalog_end_to_end(tmp_path: Path) -> None:
     combined_documents = read_documents(catalog_root)
     assert SECRET not in combined_documents
     assert SECRET.encode("utf-8") not in database_path.read_bytes()
+    assert NEW_SECRET not in combined_documents
+    assert NEW_SECRET.encode("utf-8") not in database_path.read_bytes()
 
     connection = sqlite3.connect(database_path)
     try:
@@ -228,6 +305,9 @@ def test_catalog_end_to_end(tmp_path: Path) -> None:
                 "SELECT DISTINCT analyzer FROM files"
             ).fetchall()
         }
+        semi_structure = connection.execute(
+            "SELECT structure_json FROM files WHERE relative_path = 'semi.csv'"
+        ).fetchone()[0]
     finally:
         close_connection(connection)
     assert reused_count >= 1
@@ -236,6 +316,14 @@ def test_catalog_end_to_end(tmp_path: Path) -> None:
     assert "pypdf-metadata" in analyzers
     assert "docx-zip-xml" in analyzers
     assert "pillow-metadata" in analyzers
+    assert "sqlite-schema" in analyzers
+    assert "zipfile-central-directory" in analyzers
+    assert "xml-iterparse-structure" in analyzers
+    assert "htmlparser-structure" in analyzers
+    assert "ipynb-structure" in analyzers
+    assert "pandas-stata" in analyzers
+    assert "generic-source-structure" in analyzers
+    assert '"delimiter": ";"' in semi_structure
 
     document_mtimes = {path.name: path.stat().st_mtime_ns for path in documents}
     run_cli("catalog", "--task-root", str(task_root), "--limit", "100")
@@ -437,3 +525,92 @@ def test_publication_hygiene() -> None:
     assert "name:" in skill_frontmatter
     assert "description:" in skill_frontmatter
     assert "metadata:" not in skill_frontmatter
+    assert "catalog-input-files" in skill_frontmatter
+
+
+def test_json_and_info_outputs(tmp_path: Path) -> None:
+    task_root = tmp_path / "json-task"
+    task_root.mkdir()
+    (task_root / "plain.csv").write_text("x,y\n1,2\n", encoding="utf-8")
+    run_cli("catalog", "--task-root", str(task_root), "--limit", "10")
+
+    output = run_cli(
+        "lookup", "--task-root", str(task_root), "plain.csv", "--json"
+    )
+    payload = json.loads(output)
+    assert payload["results"][0]["status"] == "fresh"
+    assert payload["results"][0]["relative_path"] == "plain.csv"
+    assert payload["summary"]["total"] == 1
+
+    info_output = run_cli("info", "--task-root", str(task_root), "--json")
+    info = json.loads(info_output)
+    assert info["results"][0]["catalog_exists"] is True
+    assert info["results"][0]["status_counts"]["fresh"] == 1
+    assert info["results"][0]["format_counts"]["CSV"] == 1
+
+    search_output = run_cli(
+        "search", "--task-root", str(task_root), "plain", "--json"
+    )
+    search_payload = json.loads(search_output)
+    assert search_payload["results"][0]["format"] == "CSV"
+
+
+def test_exclude_flag(tmp_path: Path) -> None:
+    task_root = tmp_path / "exclude-task"
+    task_root.mkdir()
+    (task_root / "keep.csv").write_text("x\n1\n", encoding="utf-8")
+    (task_root / "skip.csv").write_text("x\n2\n", encoding="utf-8")
+    output = run_cli(
+        "catalog",
+        "--task-root",
+        str(task_root),
+        "--exclude",
+        "skip.csv",
+        "--limit",
+        "10",
+    )
+    assert "skip.csv" not in output
+    assert "keep.csv" in output
+    assert "summary total=1" in output
+
+
+def test_catalog_version_migration(tmp_path: Path) -> None:
+    """A v1 database without catalog_version is migrated and re-analyzed."""
+    task_root = tmp_path / "migration-task"
+    task_root.mkdir()
+    (task_root / "plain.csv").write_text("x,y\n1,2\n", encoding="utf-8")
+    run_cli("catalog", "--task-root", str(task_root), "--limit", "10")
+
+    database_path = task_root / ".file-catalog" / "catalog.sqlite3"
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("ALTER TABLE files DROP COLUMN catalog_version")
+        connection.commit()
+    finally:
+        close_connection(connection)
+
+    run_cli("catalog", "--task-root", str(task_root), "--limit", "10")
+    connection = sqlite3.connect(database_path)
+    try:
+        versions = {
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT catalog_version FROM files"
+            ).fetchall()
+        }
+    finally:
+        close_connection(connection)
+    assert versions == {2}
+
+
+def test_archive_privacy_and_structure(tmp_path: Path) -> None:
+    """ZIP/TAR members are listed by name only; content never lands in docs."""
+    task_root = tmp_path / "archive-task"
+    task_root.mkdir()
+    zip_path = task_root / "bundle.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("data/inner.txt", f"member content {NEW_SECRET}")
+    run_cli("catalog", "--task-root", str(task_root), "--limit", "10")
+    combined = read_documents(task_root / ".file-catalog")
+    assert "inner.txt" in combined
+    assert NEW_SECRET not in combined

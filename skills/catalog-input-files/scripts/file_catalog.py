@@ -4,12 +4,14 @@
 代码介绍
 ===============================================================================
 输入：
-  1. 子命令 catalog、lookup 或 search。
+  1. 子命令 catalog、lookup、search 或 info。
   2. --task-root 指定“大任务”根目录；省略时使用当前工作目录。
   3. catalog/lookup 接受任务根目录内的文件或目录路径；search 接受检索词。
+  4. 所有子命令支持 --json 输出；catalog/lookup 支持 --exclude 附加排除名。
 
 输出：
-  - 标准输出只返回受 --limit 限制的简短状态行，适合 Agent 直接读取。
+  - 标准输出只返回受 --limit 限制的简短状态行（或 --json 的机器可读记录），
+    适合 Agent 直接读取。
   - catalog 在 <task-root>/.file-catalog/ 中写入：
       INDEX.md
       documents/<任务相对路径哈希>.md
@@ -21,7 +23,9 @@
 作用：
   把每次任务都会重复出现的“先检查输入文件”步骤封装为可复用工具。Agent 先调用
   lookup；说明缺失或过期时再调用 catalog；之后直接使用说明文档完成任务设计，
-  避免在生产脚本中混入冗长且不可复用的文件探查代码。
+  避免在生产脚本中混入冗长且不可复用的文件探查代码。技能本身与具体 Agent 平台
+  （OpenAI Codex、Claude Code、DeepSeek Harness 等）无关：任何能够执行 Python
+  命令的 Agent 都可以按相同工作流使用。
 
 设计逻辑：
   - 以任务内相对路径作为稳定身份，因此整个任务文件夹移动后仍能匹配。
@@ -29,16 +33,22 @@
   - 同一任务内 SHA-256 相同的文件复用已有结构结果。
   - 解析器按格式分层；缺少依赖或格式未知时生成通用说明和明确警告。
   - 所有读取均采用流式读取或有界采样；R 数据由同目录 inspect_r_data.R 处理。
+  - 新增格式解析器只依赖标准库：SQLite（表/列/行数）、ZIP/JAR/APK（成员清单）、
+    TAR/GZIP（成员与类型）、XML/HTML（标签与属性键）、Jupyter notebook（单元格
+    统计）；CSV/TSV 自动探测分隔符；更多编程语言按扩展名做表驱动结构提取。
   - SQLite 使用 WAL、busy_timeout 和事务；Markdown 使用临时文件 + os.replace 原子写入。
+  - catalog 的文件解析使用有界线程池并行，数据库写入仍串行，保证确定性输出。
 
 主要函数：
   resolve_task_root()      解析并验证任务根目录。
   gather_files()           递归收集任务文件并应用排除规则。
   sha256_file()            流式计算内容哈希。
+  detect_delimiter()       探测分隔文本的分隔符。
   analyze_file()           按扩展名路由到具体解析器。
   catalog_files()          增量建档、内容复用、缺失标记和索引更新。
   lookup_files()           判断说明的新鲜度。
   search_catalog()         查询任务内 SQLite 索引。
+  catalog_info()           输出任务目录的统计信息。
   render_document()        生成不含原始样例的 Markdown 说明。
   render_index()           生成可跟踪的任务级 INDEX.md。
   main()                   解析命令行并调度子命令。
@@ -46,8 +56,9 @@
 调用方式：
   python file_catalog.py catalog --task-root "D:\\project"
   python file_catalog.py catalog --task-root "D:\\project" "data\\input.csv"
-  python file_catalog.py lookup --task-root "D:\\project" "data\\input.csv"
+  python file_catalog.py lookup --task-root "D:\\project" "data\\input.csv" --json
   python file_catalog.py search --task-root "D:\\project" "species"
+  python file_catalog.py info --task-root "D:\\project"
 ===============================================================================
 """
 
@@ -55,8 +66,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import datetime as dt
+import gzip
 import hashlib
+import html.parser
 import json
 import mimetypes
 import os
@@ -65,18 +79,23 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from xml.etree import ElementTree
 
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
 SAMPLE_BYTES = 2 * 1024 * 1024
 TABLE_SAMPLE_ROWS = 1000
 MAX_STRUCTURAL_ITEMS = 200
 MAX_JSON_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 200_000
+MAX_XML_ELEMENTS = 2_000_000
+MAX_PARSE_WORKERS = 4
 EXCLUDED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -93,6 +112,15 @@ EXCLUDED_DIR_NAMES = {
     ".cache",
     "dist",
     "build",
+    ".idea",
+    ".gradle",
+    ".tox",
+    ".nox",
+    ".eggs",
+    ".terraform",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
 }
 TEXT_EXTENSIONS = {
     ".txt",
@@ -122,7 +150,229 @@ CODE_EXTENSIONS = {
     ".rs",
     ".sh",
     ".ps1",
+    ".rb",
+    ".php",
+    ".kt",
+    ".kts",
+    ".swift",
+    ".scala",
+    ".jl",
+    ".lua",
+    ".pl",
+    ".pm",
+    ".dart",
+    ".groovy",
+    ".ex",
+    ".exs",
+    ".hs",
+    ".erl",
+    ".hrl",
+    ".fs",
+    ".fsx",
+    ".vb",
 }
+ARCHIVE_EXTENSIONS = {".zip", ".jar", ".war", ".ear", ".apk", ".whl", ".egg"}
+TAR_EXTENSIONS = {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}
+SQLITE_EXTENSIONS = {".db", ".sqlite", ".sqlite3", ".db3"}
+XML_EXTENSIONS = {".xml", ".xhtml", ".xsd", ".xsl", ".xslt", ".svg", ".kml", ".gpx"}
+HTML_EXTENSIONS = {".html", ".htm"}
+
+# 语言无关的源代码结构提取表：按扩展名提供声明/导入正则。
+# 所有捕获组只取“结构名称”（函数名、类名、导入路径），不保存源码片段。
+LANGUAGE_PROFILES: Dict[str, Dict[str, str]] = {
+    ".java": {
+        "format_name": "Java source",
+        "decl_re": r"(?m)^\s*(?:public|protected|private|static|final|abstract|native|synchronized|\s)*"
+        r"(?:class|interface|enum|record|@interface)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+(?:static\s+)?([\w.]+)",
+        "package_re": r"(?m)^\s*package\s+([\w.]+)",
+    },
+    ".go": {
+        "format_name": "Go source",
+        "decl_re": r"(?m)^\s*(?:func|type|struct|interface)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+(?:[\w.]+\s+)??\"([^\"]+)\"|^\s*\"([^\"]+)\"",
+        "package_re": r"(?m)^\s*package\s+([a-z]\w*)",
+    },
+    ".rs": {
+        "format_name": "Rust source",
+        "decl_re": r"(?m)^\s*(?:pub\s+)?(?:fn|struct|enum|impl|trait|type|mod|const|static)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*(?:pub\s+)?use\s+([\w:]+)",
+    },
+    ".c": {
+        "format_name": "C source",
+        "decl_re": r"(?m)^\s*(?:static\s+|inline\s+|const\s+)*[A-Za-z_]\w*\s*\*?\s*"
+        r"([A-Za-z_]\w*)\s*\(",
+        "import_re": r"(?m)^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]",
+    },
+    ".h": {
+        "format_name": "C/C++ header",
+        "decl_re": r"(?m)^\s*(?:class|struct|enum|union|typedef)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]",
+    },
+    ".cpp": {
+        "format_name": "C++ source",
+        "decl_re": r"(?m)^\s*(?:template\s*<[^>]*>\s*)?(?:class|struct|enum|union|namespace|"
+        r"inline\s+)?(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)\s*(?:\(|\{)",
+        "import_re": r"(?m)^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]",
+    },
+    ".hpp": {
+        "format_name": "C++ header",
+        "decl_re": r"(?m)^\s*(?:class|struct|enum|union|namespace|template)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]",
+    },
+    ".cs": {
+        "format_name": "C# source",
+        "decl_re": r"(?m)^\s*(?:public|private|protected|internal|static|sealed|abstract|"
+        r"partial|readonly|async|\s)*"
+        r"(?:class|struct|interface|enum|record|namespace)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*using\s+([\w.]+)\s*;",
+    },
+    ".rb": {
+        "format_name": "Ruby source",
+        "decl_re": r"(?m)^\s*(?:def|class|module)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*require(?:_relative)?\s+[\"']([^\"']+)",
+    },
+    ".php": {
+        "format_name": "PHP source",
+        "decl_re": r"(?m)^\s*(?:function|class|interface|trait|enum)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*(?:namespace|use)\s+([A-Za-z_\\][\w\\]*)",
+    },
+    ".kt": {
+        "format_name": "Kotlin source",
+        "decl_re": r"(?m)^\s*(?:fun|class|data\s+class|object|interface|enum\s+class|"
+        r"sealed\s+class)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+([\w.]+)",
+    },
+    ".kts": {
+        "format_name": "Kotlin script",
+        "decl_re": r"(?m)^\s*(?:fun|class|data\s+class|object|interface)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+([\w.]+)",
+    },
+    ".swift": {
+        "format_name": "Swift source",
+        "decl_re": r"(?m)^\s*(?:public|private|internal|fileprivate|open|\s)*"
+        r"(?:func|class|struct|enum|protocol|extension)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+([\w.]+)",
+    },
+    ".scala": {
+        "format_name": "Scala source",
+        "decl_re": r"(?m)^\s*(?:def|class|object|trait|case\s+class|enum)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+([\w.]+)",
+    },
+    ".jl": {
+        "format_name": "Julia source",
+        "decl_re": r"(?m)^\s*(?:function|macro|struct|mutable\s+struct|abstract\s+type)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*(?:using|import)\s+([\w.]+)",
+    },
+    ".lua": {
+        "format_name": "Lua source",
+        "decl_re": r"(?m)^\s*function\s+([A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)*)",
+        "import_re": r"(?m)^\s*require\s*\(\s*[\"']([^\"']+)",
+    },
+    ".pl": {
+        "format_name": "Perl source",
+        "decl_re": r"(?m)^\s*sub\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*use\s+([A-Za-z_:]+)",
+    },
+    ".pm": {
+        "format_name": "Perl module",
+        "decl_re": r"(?m)^\s*sub\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*use\s+([A-Za-z_:]+)",
+    },
+    ".dart": {
+        "format_name": "Dart source",
+        "decl_re": r"(?m)^\s*(?:class|enum|mixin|extension)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+[\"']([^\"']+)",
+    },
+    ".groovy": {
+        "format_name": "Groovy source",
+        "decl_re": r"(?m)^\s*(?:def|class|interface|enum|trait)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*import\s+([\w.]+)",
+    },
+    ".ex": {
+        "format_name": "Elixir source",
+        "decl_re": r"(?m)^\s*defp?\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*(?:use|import|require)\s+([\w.]+)",
+    },
+    ".exs": {
+        "format_name": "Elixir script",
+        "decl_re": r"(?m)^\s*defp?\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*(?:use|import|require)\s+([\w.]+)",
+    },
+    ".hs": {
+        "format_name": "Haskell source",
+        "decl_re": r"(?m)^\s*[A-Za-z_][\w']*\s*::",
+        "import_re": r"(?m)^\s*import\s+(?:qualified\s+)?([A-Za-z_.]+)",
+    },
+    ".erl": {
+        "format_name": "Erlang source",
+        "decl_re": r"(?m)^\s*([a-z][\w@]*)\s*\([^)]*\)\s*->",
+        "import_re": r"(?m)^\s*-include(?:_lib)?\s*\(\s*[\"']([^\"']+)",
+    },
+    ".hrl": {
+        "format_name": "Erlang header",
+        "decl_re": r"(?m)^\s*([a-z][\w@]*)\s*\([^)]*\)\s*->",
+        "import_re": r"(?m)^\s*-include(?:_lib)?\s*\(\s*[\"']([^\"']+)",
+    },
+    ".fs": {
+        "format_name": "F# source",
+        "decl_re": r"(?m)^\s*(?:let|type|module|namespace)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*open\s+([\w.]+)",
+    },
+    ".fsx": {
+        "format_name": "F# script",
+        "decl_re": r"(?m)^\s*(?:let|type|module)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*open\s+([\w.]+)",
+    },
+    ".vb": {
+        "format_name": "Visual Basic source",
+        "decl_re": r"(?m)^\s*(?:Sub|Function|Class|Module|Interface|Enum)\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*Imports\s+([\w.]+)",
+    },
+    ".sh": {
+        "format_name": "Shell script",
+        "decl_re": r"(?m)^\s*(?:function\s+)?([A-Za-z_]\w*)\s*\(\s*\)",
+        "import_re": r"(?m)^\s*\.\s+([^\s]+)|^\s*source\s+([^\s]+)",
+    },
+    ".ps1": {
+        "format_name": "PowerShell script",
+        "decl_re": r"(?m)^\s*function\s+([A-Za-z_]\w*)",
+        "import_re": r"(?m)^\s*(?:Import-Module|using\s+module)\s+([^\s\"]+)",
+    },
+    ".js": {
+        "format_name": "JavaScript source",
+        "decl_re": r"(?m)^\s*(?:export\s+default\s+)?(?:function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        "import_re": r"(?m)^\s*import\s+.*?\s+from\s+[\"']([^\"']+)[\"']",
+    },
+    ".jsx": {
+        "format_name": "JavaScript/JSX source",
+        "decl_re": r"(?m)^\s*(?:export\s+default\s+)?(?:function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        "import_re": r"(?m)^\s*import\s+.*?\s+from\s+[\"']([^\"']+)[\"']",
+    },
+    ".ts": {
+        "format_name": "TypeScript source",
+        "decl_re": r"(?m)^\s*(?:export\s+default\s+)?(?:function|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        "import_re": r"(?m)^\s*import\s+.*?\s+from\s+[\"']([^\"']+)[\"']",
+    },
+    ".tsx": {
+        "format_name": "TypeScript/TSX source",
+        "decl_re": r"(?m)^\s*(?:export\s+default\s+)?(?:function|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        "import_re": r"(?m)^\s*import\s+.*?\s+from\s+[\"']([^\"']+)[\"']",
+    },
+    ".r": {
+        "format_name": "R source",
+        "decl_re": r"(?m)^\s*([A-Za-z.][A-Za-z0-9._]*)\s*(?:<-|=)\s*function\s*\(",
+        "import_re": r"(?m)\b(?:library|require)\s*\(\s*[\"']?([A-Za-z0-9._]+)",
+    },
+}
+
+# 通用声明正则（未单列语言的兜底），覆盖 def/func/fn/function/class/struct/interface 等。
+GENERIC_DECL_RE = (
+    r"(?m)^\s*(?:pub\s+|private\s+|protected\s+|internal\s+|static\s+|"
+    r"final\s+|abstract\s+|async\s+|export\s+|default\s+)*"
+    r"(?:def|func|fn|function|class|struct|interface|enum|trait|type|object|"
+    r"module|package|mixin|extension|record)\s+([A-Za-z_]\w*)"
+)
 
 
 @dataclass
@@ -199,11 +449,13 @@ def document_id(relative_path: str) -> str:
 def gather_files(
     task_root: Path,
     raw_paths: Sequence[str],
+    extra_excludes: Sequence[str] = (),
 ) -> Tuple[List[Path], List[Dict[str, str]], bool]:
     full_scan = len(raw_paths) == 0
     requested = [task_root] if full_scan else [resolve_input_path(x, task_root) for x in raw_paths]
     files: Dict[str, Path] = {}
     issues: List[Dict[str, str]] = []
+    extra_excluded = {name.casefold() for name in extra_excludes if name.strip()}
 
     for requested_path in requested:
         if not requested_path.exists():
@@ -234,11 +486,14 @@ def gather_files(
                 name
                 for name in directory_names
                 if name.casefold() not in EXCLUDED_DIR_NAMES
+                and name.casefold() not in extra_excluded
                 and not (current / name).is_symlink()
             ]
             for file_name in file_names:
                 candidate = current / file_name
                 if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                if file_name.casefold() in extra_excluded:
                     continue
                 key = relative_key(candidate.resolve(), task_root)
                 files[key.casefold()] = candidate.resolve()
@@ -258,9 +513,8 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def read_text_sample(path: Path, max_bytes: int = SAMPLE_BYTES) -> Tuple[Optional[str], str, bool]:
-    raw = path.open("rb").read(max_bytes)
-    truncated = path.stat().st_size > len(raw)
+def decode_text_sample(raw: bytes, truncated: bool) -> Tuple[Optional[str], str, bool]:
+    """Decode a bounded byte sample to text when it plausibly is text."""
     if b"\x00" in raw[:4096] and not raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return None, "binary", truncated
 
@@ -281,6 +535,12 @@ def read_text_sample(path: Path, max_bytes: int = SAMPLE_BYTES) -> Tuple[Optiona
     except UnicodeDecodeError:
         pass
     return None, "binary", truncated
+
+
+def read_text_sample(path: Path, max_bytes: int = SAMPLE_BYTES) -> Tuple[Optional[str], str, bool]:
+    raw = path.open("rb").read(max_bytes)
+    truncated = path.stat().st_size > len(raw)
+    return decode_text_sample(raw, truncated)
 
 
 def json_type(value: Any) -> str:
@@ -349,8 +609,67 @@ def column_structure(frame: Any) -> List[Dict[str, Any]]:
     return columns
 
 
-def analyze_delimited(path: Path, separator: str) -> Analysis:
+def detect_delimiter(path: Path, hints: Sequence[str] = ()) -> str:
+    """Detect the most consistent field delimiter from a bounded text sample.
+
+    Scores candidates by how many sampled lines split into the same nonzero
+    number of fields.  Quotes are honored via csv.reader so commas inside
+    quoted fields do not distort the score.
+    """
+    candidates = list(hints) + [",", "\t", ";", "|"]
+    seen: Set[str] = set()
+    unique_candidates: List[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+
+    sample = path.open("rb").read(SAMPLE_BYTES)
+    for encoding in ("utf-8-sig", "gb18030", "latin-1"):
+        try:
+            text = sample.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = sample.decode("latin-1", errors="replace")
+    lines = text.splitlines()[:200]
+
+    best_delimiter = unique_candidates[0]
+    best_score = -1.0
+    for delimiter in unique_candidates:
+        consistent_lines = 0
+        column_totals = 0
+        inspected = 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            try:
+                fields = next(csv.reader([line], delimiter=delimiter))
+            except csv.Error:
+                continue
+            inspected += 1
+            column_totals += len(fields)
+            if len(fields) > 1:
+                consistent_lines += 1
+        if inspected == 0:
+            continue
+        score = consistent_lines + (column_totals / max(1, inspected)) * 0.01
+        if score > best_score:
+            best_score = score
+            best_delimiter = delimiter
+    return best_delimiter
+
+
+def analyze_delimited(path: Path, separator: Optional[str] = None) -> Analysis:
     import pandas as pd
+
+    if separator is None:
+        hints: Sequence[str] = []
+        if path.suffix.casefold() in {".tsv", ".tab"}:
+            hints = ["\t"]
+        separator = detect_delimiter(path, hints)
 
     warnings: List[str] = []
     last_error: Optional[Exception] = None
@@ -376,6 +695,7 @@ def analyze_delimited(path: Path, separator: str) -> Analysis:
     language = detect_language(names)
     structure = {
         "encoding": encoding,
+        "delimiter": "tab" if separator == "\t" else separator,
         "sample_rows": int(len(frame)),
         "row_count": "not fully counted",
         "column_count": int(len(frame.columns)),
@@ -645,48 +965,13 @@ def analyze_code_or_text(path: Path) -> Analysis:
         structure["headings"] = headings[:MAX_STRUCTURAL_ITEMS]
         structure["heading_count_in_sample"] = len(headings)
         format_name = "Markdown/text document"
-    elif extension == ".r":
-        functions = re.findall(
-            r"(?m)^\s*([A-Za-z.][A-Za-z0-9._]*)\s*(?:<-|=)\s*function\s*\(",
-            text,
-        )
-        packages = re.findall(
-            r"(?m)\b(?:library|require)\s*\(\s*[\"']?([A-Za-z0-9._]+)",
-            text,
-        )
-        structure["functions"] = [
-            clean_structural_name(x) for x in functions[:MAX_STRUCTURAL_ITEMS]
-        ]
-        structure["packages"] = [
-            clean_structural_name(x) for x in packages[:MAX_STRUCTURAL_ITEMS]
-        ]
-        format_name = "R source"
-        analyzer = "r-source-structure"
-    elif extension in {".js", ".jsx", ".ts", ".tsx"}:
-        functions = re.findall(
-            r"(?m)\b(?:function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
-            text,
-        )
-        imports = re.findall(
-            r"(?m)^\s*import\s+.*?\s+from\s+[\"']([^\"']+)[\"']",
-            text,
-        )
-        structure["declared_functions_or_classes"] = [
-            clean_structural_name(x) for x in functions[:MAX_STRUCTURAL_ITEMS]
-        ]
-        structure["imports"] = [
-            clean_structural_name(x) for x in imports[:MAX_STRUCTURAL_ITEMS]
-        ]
-        format_name = "JavaScript/TypeScript source"
-        analyzer = "js-ts-source-structure"
     elif extension in CODE_EXTENSIONS:
-        functions = re.findall(
-            r"(?m)^\s*(?:def|func|fn|function|class|struct|interface)\s+"
-            r"([A-Za-z_][A-Za-z0-9_]*)",
-            text,
-        )
+        profile = LANGUAGE_PROFILES.get(extension)
+        if profile:
+            return analyze_generic_source(path, text, encoding, truncated)
+        declarations = re.findall(GENERIC_DECL_RE, text)
         structure["declarations"] = [
-            clean_structural_name(x) for x in functions[:MAX_STRUCTURAL_ITEMS]
+            clean_structural_name(x) for x in declarations[:MAX_STRUCTURAL_ITEMS]
         ]
         format_name = f"{extension.lstrip('.').upper()} source"
         analyzer = "generic-source-structure"
@@ -800,6 +1085,514 @@ def analyze_image(path: Path) -> Analysis:
         summary_en=f"Image file; dimensions are {structure['width']}×{structure['height']} with mode {structure['mode']}.",
         structure=structure,
         warnings=["Pixel content and metadata values were not copied into the catalog."],
+    )
+
+
+def analyze_sqlite(path: Path) -> Analysis:
+    """Read a SQLite schema read-only through the standard library.
+
+    Only schema objects (table/view/index names, column names and declared
+    types) and row counts are recorded.  No cell values are read.
+    """
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise RuntimeError(f"SQLite open failed: {error}") from error
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 200"
+        ).fetchall()
+        views = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='view' ORDER BY name LIMIT 200"
+        ).fetchall()
+        indexes = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL "
+            "ORDER BY name LIMIT 200"
+        ).fetchall()
+        described: List[Dict[str, Any]] = []
+        truncated_tables = len(tables) > 100
+        for (table_name,) in tables[:100]:
+            columns = connection.execute(
+                f'PRAGMA table_info("{table_name.replace(chr(34), chr(34) * 2)}")'
+            ).fetchall()
+            row_count: Optional[int] = None
+            try:
+                row_count = connection.execute(
+                    f'SELECT count(*) FROM "{table_name.replace(chr(34), chr(34) * 2)}"'
+                ).fetchone()[0]
+            except sqlite3.Error:
+                row_count = None
+            described.append(
+                {
+                    "name": clean_structural_name(table_name),
+                    "column_count": len(columns),
+                    "row_count": row_count,
+                    "columns": [
+                        {
+                            "name": clean_structural_name(column[1]),
+                            "declared_type": clean_structural_name(column[2]),
+                            "notnull": bool(column[3]),
+                            "primary_key": bool(column[5]),
+                        }
+                        for column in columns[:MAX_STRUCTURAL_ITEMS]
+                    ],
+                    "truncated_columns": len(columns) > MAX_STRUCTURAL_ITEMS,
+                }
+            )
+    except sqlite3.Error as error:
+        raise RuntimeError(f"SQLite schema inspection failed: {error}") from error
+    finally:
+        connection.close()
+    structure = {
+        "table_count": len(tables),
+        "view_count": len(views),
+        "index_count": len(indexes),
+        "tables": described,
+        "truncated_tables": truncated_tables,
+    }
+    return Analysis(
+        format_name="SQLite database",
+        analyzer="sqlite-schema",
+        status="fresh",
+        language="zh",
+        summary_zh=f"SQLite 数据库；识别 {len(tables)} 张表、{len(views)} 个视图和 {len(indexes)} 个索引。",
+        summary_en=f"SQLite database; identified {len(tables)} tables, {len(views)} views, and {len(indexes)} indexes.",
+        structure=structure,
+        warnings=["Only schema objects and row counts were recorded; cell values were never read."],
+    )
+
+
+def analyze_zip_archive(path: Path) -> Analysis:
+    """List archive members from the central directory without extracting."""
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+        truncated = len(infos) > MAX_ARCHIVE_MEMBERS
+        infos = infos[:MAX_ARCHIVE_MEMBERS]
+        extension_counts: Dict[str, int] = {}
+        top_level: Set[str] = set()
+        duplicates = 0
+        seen_names: Set[str] = set()
+        total_uncompressed = 0
+        total_compressed = 0
+        for info in infos:
+            name = info.filename
+            total_uncompressed += info.file_size
+            total_compressed += info.compress_size
+            top_level.add(name.split("/", 1)[0])
+            if name.casefold() in seen_names:
+                duplicates += 1
+            seen_names.add(name.casefold())
+            extension = Path(name).suffix.casefold()
+            extension_counts[extension or "(none)"] = (
+                extension_counts.get(extension or "(none)", 0) + 1
+            )
+        top_extensions = sorted(
+            extension_counts.items(), key=lambda item: item[1], reverse=True
+        )[:20]
+    structure = {
+        "member_count": len(infos),
+        "member_names": [
+            clean_structural_name(info.filename) for info in infos[:MAX_STRUCTURAL_ITEMS]
+        ],
+        "total_uncompressed_bytes": total_uncompressed,
+        "total_compressed_bytes": total_compressed,
+        "duplicate_name_count": duplicates,
+        "encrypted_member_count": sum(1 for info in infos if info.flag_bits & 0x1),
+        "top_level_entries": sorted(top_level)[:MAX_STRUCTURAL_ITEMS],
+        "extension_histogram": [
+            {"extension": name, "count": count}
+            for name, count in top_extensions
+        ],
+        "truncated_members": truncated,
+        "truncated_member_names": len(infos) > MAX_STRUCTURAL_ITEMS,
+    }
+    warnings = (
+        [f"Archive has more than {MAX_ARCHIVE_MEMBERS} members; only the first batch was listed."]
+        if truncated
+        else []
+    )
+    warnings.append("Member contents were not extracted or read.")
+    return Analysis(
+        format_name="ZIP archive",
+        analyzer="zipfile-central-directory",
+        status="fresh",
+        language="zh",
+        summary_zh=f"ZIP 归档；列出 {len(infos)} 个成员及类型直方图。",
+        summary_en=f"ZIP archive; listed {len(infos)} members and a type histogram.",
+        structure=structure,
+        warnings=warnings,
+    )
+
+
+def analyze_tar_archive(path: Path) -> Analysis:
+    """Describe TAR/TAR.GZ/TAR.BZ2/TAR.XZ member lists without extraction."""
+    type_labels = {
+        tarfile.REGTYPE: "file",
+        tarfile.AREGTYPE: "file",
+        tarfile.DIRTYPE: "directory",
+        tarfile.SYMTYPE: "symlink",
+        tarfile.LNKTYPE: "hardlink",
+        tarfile.CHRTYPE: "char-device",
+        tarfile.BLKTYPE: "block-device",
+        tarfile.FIFOTYPE: "fifo",
+    }
+    extension_counts: Dict[str, int] = {}
+    type_counts: Dict[str, int] = {}
+    top_level: Set[str] = set()
+    total_size = 0
+    member_count = 0
+    truncated = False
+    first_members: List[Any] = []
+    with tarfile.open(path, mode="r:*") as archive:
+        for member in archive:
+            if member_count >= MAX_ARCHIVE_MEMBERS:
+                truncated = True
+                break
+            member_count += 1
+            if len(first_members) < MAX_STRUCTURAL_ITEMS:
+                first_members.append(member)
+            label = type_labels.get(member.type, "other")
+            type_counts[label] = type_counts.get(label, 0) + 1
+            top_level.add(member.name.split("/", 1)[0])
+            if member.isreg():
+                total_size += member.size
+                extension = Path(member.name).suffix.casefold()
+                extension_counts[extension or "(none)"] = (
+                    extension_counts.get(extension or "(none)", 0) + 1
+                )
+    top_extensions = sorted(
+        extension_counts.items(), key=lambda item: item[1], reverse=True
+    )[:20]
+    structure = {
+        "member_count": member_count,
+        "member_names": [
+            clean_structural_name(member.name) for member in first_members
+        ],
+        "total_regular_size_bytes": total_size,
+        "member_type_counts": type_counts,
+        "top_level_entries": sorted(top_level)[:MAX_STRUCTURAL_ITEMS],
+        "extension_histogram": [
+            {"extension": name, "count": count}
+            for name, count in top_extensions
+        ],
+        "truncated_members": truncated,
+        "truncated_member_names": len(first_members) > MAX_STRUCTURAL_ITEMS,
+    }
+    warnings = (
+        [f"Archive has more than {MAX_ARCHIVE_MEMBERS} members; listing stopped early."]
+        if truncated
+        else []
+    )
+    warnings.append("Member contents were not extracted or read.")
+    return Analysis(
+        format_name="TAR archive",
+        analyzer="tarfile-members",
+        status="fresh",
+        language="zh",
+        summary_zh=f"TAR 归档；列出 {member_count} 个成员及类型分布。",
+        summary_en=f"TAR archive; listed {member_count} members and type distribution.",
+        structure=structure,
+        warnings=warnings,
+    )
+
+
+def analyze_gzip_stream(path: Path) -> Analysis:
+    """Describe a plain gzip stream (not a TAR) from its header and a bounded sample."""
+    with gzip.open(path, "rb") as handle:
+        header_name = getattr(handle, "name", None)
+        if isinstance(header_name, bytes):
+            header_name = header_name.decode("utf-8", errors="replace")
+        raw = handle.read(SAMPLE_BYTES)
+    text, encoding, sample_truncated = decode_text_sample(raw, truncated=True)
+    structure: Dict[str, Any] = {
+        "header_filename": clean_structural_name(header_name) if header_name else None,
+        "compressed_size_bytes": path.stat().st_size,
+        "decompressed_sample_bytes": len(raw),
+        "sample_truncated": sample_truncated,
+    }
+    if text is not None:
+        structure["decoded_sample"] = True
+        structure["detected_encoding"] = encoding
+        structure["sample_line_count"] = len(text.splitlines())
+    else:
+        structure["decoded_sample"] = False
+    warnings = [
+        "Only the first bounded decompressed sample was inspected; "
+        "total decompressed size was not materialized."
+    ]
+    return Analysis(
+        format_name="GZIP stream",
+        analyzer="gzip-header-sample",
+        status="fresh",
+        language=detect_language(text[:20000]) if text else "zh",
+        summary_zh="gzip 压缩流；记录了头部信息与有界解压样本结构。",
+        summary_en="gzip stream; recorded header information and a bounded decompressed sample.",
+        structure=structure,
+        warnings=warnings,
+    )
+
+
+def analyze_xml(path: Path) -> Analysis:
+    """Count XML tags, attribute keys, namespaces, and depth without keeping text."""
+    tags: Dict[str, int] = {}
+    attribute_keys: Set[str] = set()
+    namespaces: Set[str] = set()
+    max_depth = 0
+    depth = 0
+    element_count = 0
+    truncated = False
+    for event, element in ElementTree.iterparse(str(path), events=("start", "end")):
+        if event == "start":
+            element_count += 1
+            if element_count > MAX_XML_ELEMENTS:
+                truncated = True
+                element.clear()
+                break
+            depth += 1
+            max_depth = max(max_depth, depth)
+            tag = element.tag
+            if isinstance(tag, str) and tag.startswith("{"):
+                namespace, _, local = tag[1:].partition("}")
+                namespaces.add(namespace)
+                tag = local
+            tags[str(tag)] = tags.get(str(tag), 0) + 1
+            if len(tags) <= 500:
+                attribute_keys.update(clean_structural_name(key) for key in element.attrib.keys())
+            element.clear()
+        else:
+            depth -= 1
+    top_tags = sorted(tags.items(), key=lambda item: item[1], reverse=True)[:30]
+    structure = {
+        "root_tag": next(iter(tags), None),
+        "element_count": element_count,
+        "max_nesting_depth": max_depth,
+        "namespace_count": len(namespaces),
+        "distinct_tag_count": len(tags),
+        "top_tags": [{"tag": name, "count": count} for name, count in top_tags],
+        "attribute_keys": sorted(attribute_keys)[:MAX_STRUCTURAL_ITEMS],
+        "truncated_elements": truncated,
+    }
+    warnings = (
+        [f"XML has more than {MAX_XML_ELEMENTS} elements; counting stopped early."]
+        if truncated
+        else []
+    )
+    warnings.append("Text content and attribute values were not copied into the catalog.")
+    return Analysis(
+        format_name="XML document",
+        analyzer="xml-iterparse-structure",
+        status="fresh",
+        language="zh",
+        summary_zh=f"XML 文档；统计了 {element_count} 个元素、{len(namespaces)} 个命名空间和 {len(tags)} 种标签。",
+        summary_en=f"XML document; counted {element_count} elements, {len(namespaces)} namespaces, and {len(tags)} distinct tags.",
+        structure=structure,
+        warnings=warnings,
+    )
+
+
+class _TagCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: Dict[str, int] = {}
+        self.heading_counts: Dict[str, int] = {}
+        self.attribute_keys: Set[str] = set()
+        self.counts = {
+            "table": 0,
+            "tr": 0,
+            "td": 0,
+            "th": 0,
+            "link": 0,
+            "img": 0,
+            "script": 0,
+            "style": 0,
+            "form": 0,
+            "input": 0,
+            "iframe": 0,
+        }
+        self.has_title = False
+        self.title_open = False
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.casefold()
+        self.tags[tag] = self.tags.get(tag, 0) + 1
+        if tag in self.counts:
+            self.counts[tag] += 1
+        if tag.startswith("h") and len(tag) == 2 and tag[1].isdigit():
+            self.heading_counts[tag] = self.heading_counts.get(tag, 0) + 1
+        if tag == "title":
+            self.title_open = True
+        if len(self.attribute_keys) < 500:
+            self.attribute_keys.update(clean_structural_name(key) for key, _ in attrs)
+
+    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "title":
+            self.title_open = False
+
+
+def analyze_html(path: Path) -> Analysis:
+    raw = path.open("rb").read(SAMPLE_BYTES)
+    truncated = path.stat().st_size > len(raw)
+    for encoding in ("utf-8-sig", "gb18030", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("latin-1", errors="replace")
+    collector = _TagCollector()
+    collector.feed(text)
+    collector.close()
+    top_tags = sorted(
+        collector.tags.items(), key=lambda item: item[1], reverse=True
+    )[:30]
+    structure = {
+        "encoding": encoding,
+        "sample_truncated": truncated,
+        "distinct_tag_count": len(collector.tags),
+        "top_tags": [{"tag": name, "count": count} for name, count in top_tags],
+        "heading_counts": collector.heading_counts,
+        "structural_counts": collector.counts,
+        "has_title": collector.has_title,
+        "attribute_keys": sorted(collector.attribute_keys)[:MAX_STRUCTURAL_ITEMS],
+    }
+    warnings = (
+        ["Only a bounded HTML prefix was inspected."] if truncated else []
+    )
+    warnings.append("Visible text and attribute values were not copied into the catalog.")
+    return Analysis(
+        format_name="HTML document",
+        analyzer="htmlparser-structure",
+        status="fresh",
+        language=detect_language(text[:20000]),
+        summary_zh=f"HTML 文档；统计了 {len(collector.tags)} 种标签及标题/表格/链接结构。",
+        summary_en=f"HTML document; counted {len(collector.tags)} distinct tags plus heading/table/link structure.",
+        structure=structure,
+        warnings=warnings,
+    )
+
+
+def analyze_ipynb(path: Path) -> Analysis:
+    if path.stat().st_size > MAX_JSON_BYTES:
+        raise RuntimeError(
+            f"Notebook file exceeds bounded parse limit of {MAX_JSON_BYTES} bytes."
+        )
+    with path.open("r", encoding="utf-8-sig") as handle:
+        notebook = json.load(handle)
+    cells = notebook.get("cells", [])
+    cell_types: Dict[str, int] = {}
+    languages: Set[str] = set()
+    executed_cells = 0
+    for cell in cells:
+        cell_type = str(cell.get("cell_type", "unknown"))
+        cell_types[cell_type] = cell_types.get(cell_type, 0) + 1
+        if cell.get("execution_count") is not None:
+            executed_cells += 1
+    metadata = notebook.get("metadata") or {}
+    kernelspec = metadata.get("kernelspec") or {}
+    language_info = metadata.get("language_info") or {}
+    if kernelspec.get("language"):
+        languages.add(str(kernelspec["language"]))
+    if language_info.get("name"):
+        languages.add(str(language_info["name"]))
+    structure = {
+        "nbformat": notebook.get("nbformat"),
+        "nbformat_minor": notebook.get("nbformat_minor"),
+        "cell_count": len(cells),
+        "cell_type_counts": cell_types,
+        "executed_cell_count": executed_cells,
+        "languages": sorted(languages),
+        "kernelspec_name": clean_structural_name(kernelspec.get("name"))
+        if kernelspec.get("name")
+        else None,
+    }
+    return Analysis(
+        format_name="Jupyter notebook",
+        analyzer="ipynb-structure",
+        status="fresh",
+        language="zh",
+        summary_zh=f"Jupyter notebook；包含 {len(cells)} 个单元格，类型分布为 {cell_types}。",
+        summary_en=f"Jupyter notebook; contains {len(cells)} cells with type distribution {cell_types}.",
+        structure=structure,
+        warnings=["Cell source, outputs, and display data were not copied into the catalog."],
+    )
+
+
+def analyze_stata(path: Path) -> Analysis:
+    import pandas as pd
+
+    reader = pd.read_stata(path, iterator=True)
+    try:
+        frame = reader.get_chunk(TABLE_SAMPLE_ROWS)
+        variable_count = len(frame.columns)
+    finally:
+        reader.close()
+    language = detect_language(" ".join(clean_structural_name(x) for x in frame.columns))
+    structure = {
+        "sample_rows": int(len(frame)),
+        "column_count": variable_count,
+        "columns": column_structure(frame),
+        "truncated_columns": variable_count > MAX_STRUCTURAL_ITEMS,
+    }
+    return Analysis(
+        format_name="Stata dataset",
+        analyzer="pandas-stata",
+        status="fresh",
+        language=language,
+        summary_zh=f"Stata 数据集；已采样 {len(frame)} 行并识别 {variable_count} 个变量。",
+        summary_en=f"Stata dataset; sampled {len(frame)} rows and identified {variable_count} variables.",
+        structure=structure,
+        warnings=[
+            "Value labels and cell values were not copied into the catalog.",
+            f"Statistics use at most the first {TABLE_SAMPLE_ROWS} records.",
+        ],
+    )
+
+
+def analyze_generic_source(path: Path, text: str, encoding: str, truncated: bool) -> Analysis:
+    """Table-driven structural analysis for many programming languages."""
+    extension = path.suffix.casefold()
+    profile = LANGUAGE_PROFILES.get(extension, {})
+    structure: Dict[str, Any] = {
+        "encoding": encoding,
+        "sample_line_count": len(text.splitlines()),
+        "sample_truncated": truncated,
+    }
+    decl_pattern = profile.get("decl_re") or GENERIC_DECL_RE
+    declarations = re.findall(decl_pattern, text)
+    structure["declarations"] = [
+        clean_structural_name(x) for x in declarations[:MAX_STRUCTURAL_ITEMS]
+    ]
+    if profile.get("import_re"):
+        imports = re.findall(profile["import_re"], text)
+        flattened = [item for match in imports for item in (match if isinstance(match, tuple) else (match,)) if item]
+        structure["imports"] = [
+            clean_structural_name(x) for x in flattened[:MAX_STRUCTURAL_ITEMS]
+        ]
+    if profile.get("package_re"):
+        packages = re.findall(profile["package_re"], text)
+        structure["packages"] = [
+            clean_structural_name(x) for x in packages[:MAX_STRUCTURAL_ITEMS]
+        ]
+    format_name = profile.get("format_name") or f"{extension.lstrip('.').upper()} source"
+    return Analysis(
+        format_name=format_name,
+        analyzer="generic-source-structure",
+        status="fresh",
+        language=detect_language(text[:20000]),
+        summary_zh=f"{format_name}；已记录编码、行数和可识别的结构性名称。",
+        summary_en=f"{format_name}; recorded encoding, line counts, and recognizable structural names.",
+        structure=structure,
+        warnings=(
+            ["Only a bounded prefix was inspected; counts may be incomplete."]
+            if truncated
+            else []
+        ),
     )
 
 
@@ -925,10 +1718,8 @@ def generic_analysis(path: Path, reason: Optional[str] = None) -> Analysis:
 def analyze_file(path: Path) -> Analysis:
     extension = path.suffix.casefold()
     try:
-        if extension == ".csv":
-            return analyze_delimited(path, ",")
-        if extension in {".tsv", ".tab"}:
-            return analyze_delimited(path, "\t")
+        if extension in {".csv", ".tsv", ".tab"}:
+            return analyze_delimited(path, None)
         if extension in {".xlsx", ".xls", ".xlsm", ".ods"}:
             return analyze_excel(path)
         if extension == ".parquet":
@@ -960,6 +1751,22 @@ def analyze_file(path: Path) -> Analysis:
             ".webp",
         }:
             return analyze_image(path)
+        if extension in SQLITE_EXTENSIONS:
+            return analyze_sqlite(path)
+        if extension in ARCHIVE_EXTENSIONS:
+            return analyze_zip_archive(path)
+        if extension in TAR_EXTENSIONS:
+            return analyze_tar_archive(path)
+        if extension == ".gz":
+            return analyze_gzip_stream(path)
+        if extension in XML_EXTENSIONS:
+            return analyze_xml(path)
+        if extension in HTML_EXTENSIONS:
+            return analyze_html(path)
+        if extension == ".ipynb":
+            return analyze_ipynb(path)
+        if extension == ".dta":
+            return analyze_stata(path)
         if extension in TEXT_EXTENSIONS or extension in CODE_EXTENSIONS:
             return analyze_code_or_text(path)
         return generic_analysis(path)
@@ -1036,7 +1843,8 @@ def connect_database(database_path: Path, create: bool) -> Optional[sqlite3.Conn
                 warnings_json TEXT NOT NULL,
                 search_text TEXT NOT NULL,
                 analyzed_at TEXT NOT NULL,
-                reused_from TEXT
+                reused_from TEXT,
+                catalog_version INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -1046,6 +1854,14 @@ def connect_database(database_path: Path, create: bool) -> Optional[sqlite3.Conn
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_files_status ON files(status)"
         )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(files)").fetchall()
+        }
+        if "catalog_version" not in columns:
+            connection.execute(
+                "ALTER TABLE files ADD COLUMN catalog_version INTEGER NOT NULL DEFAULT 0"
+            )
         connection.commit()
     return connection
 
@@ -1212,8 +2028,8 @@ def upsert_entry(
             relative_path, source_absolute, task_root_at_scan, document_relative,
             size_bytes, mtime_ns, sha256, file_type, analyzer, language, status,
             summary_zh, summary_en, structure_json, warnings_json, search_text,
-            analyzed_at, reused_from
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            analyzed_at, reused_from, catalog_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(relative_path) DO UPDATE SET
             source_absolute=excluded.source_absolute,
             task_root_at_scan=excluded.task_root_at_scan,
@@ -1231,7 +2047,8 @@ def upsert_entry(
             warnings_json=excluded.warnings_json,
             search_text=excluded.search_text,
             analyzed_at=excluded.analyzed_at,
-            reused_from=excluded.reused_from
+            reused_from=excluded.reused_from,
+            catalog_version=excluded.catalog_version
         """,
         (
             relative_path,
@@ -1252,6 +2069,7 @@ def upsert_entry(
             search_text,
             utc_now(),
             reused_from,
+            CATALOG_VERSION,
         ),
     )
 
@@ -1309,87 +2127,144 @@ def result_record(
 def catalog_files(
     task_root: Path,
     raw_paths: Sequence[str],
+    extra_excludes: Sequence[str] = (),
 ) -> List[Dict[str, str]]:
     catalog_root, documents_root, database_path = ensure_catalog(task_root)
     connection = connect_database(database_path, create=True)
     assert connection is not None
-    candidates, issues, full_scan = gather_files(task_root, raw_paths)
+    candidates, issues, full_scan = gather_files(task_root, raw_paths, extra_excludes)
     results = list(issues)
     seen: set[str] = set()
 
-    try:
-        for source in candidates:
-            relative_path = relative_key(source, task_root)
-            seen.add(relative_path)
-            stat = source.stat()
-            row = connection.execute(
-                "SELECT * FROM files WHERE relative_path = ?",
-                (relative_path,),
-            ).fetchone()
-            doc_relative = f"documents/{document_id(relative_path)}.md"
-            doc_path = catalog_root / doc_relative
+    # 第一阶段：串行确定每个文件的新鲜度，并完成跨运行的内容复用。
+    pending: List[Tuple[Path, str, str, Path, str]] = []
+    for source in candidates:
+        relative_path = relative_key(source, task_root)
+        seen.add(relative_path)
+        stat = source.stat()
+        row = connection.execute(
+            "SELECT * FROM files WHERE relative_path = ?",
+            (relative_path,),
+        ).fetchone()
+        doc_relative = f"documents/{document_id(relative_path)}.md"
+        doc_path = catalog_root / doc_relative
 
+        if (
+            row is not None
+            and row["size_bytes"] == stat.st_size
+            and row["mtime_ns"] == stat.st_mtime_ns
+            and row["status"] != "missing"
+            and row["catalog_version"] == CATALOG_VERSION
+            and doc_path.exists()
+        ):
             if (
-                row is not None
-                and row["size_bytes"] == stat.st_size
-                and row["mtime_ns"] == stat.st_mtime_ns
-                and row["status"] != "missing"
-                and doc_path.exists()
+                row["source_absolute"] != str(source)
+                or row["task_root_at_scan"] != str(task_root)
             ):
-                if (
-                    row["source_absolute"] != str(source)
-                    or row["task_root_at_scan"] != str(task_root)
-                ):
-                    stored_analysis = analysis_from_row(row)
-                    relocated_document = render_document(
-                        task_root,
-                        source,
-                        relative_path,
-                        row["sha256"],
-                        stored_analysis,
-                        row["reused_from"],
-                    )
-                    atomic_write_text(doc_path, relocated_document)
-                    upsert_entry(
-                        connection,
-                        task_root,
-                        source,
-                        relative_path,
-                        doc_relative,
-                        row["sha256"],
-                        stored_analysis,
-                        row["reused_from"],
-                    )
-                results.append(
-                    result_record(
-                        row["status"],
-                        source,
-                        relative_path,
-                        str(doc_path),
-                        row["reused_from"],
-                    )
+                stored_analysis = analysis_from_row(row)
+                relocated_document = render_document(
+                    task_root,
+                    source,
+                    relative_path,
+                    row["sha256"],
+                    stored_analysis,
+                    row["reused_from"],
                 )
-                continue
+                atomic_write_text(doc_path, relocated_document)
+                upsert_entry(
+                    connection,
+                    task_root,
+                    source,
+                    relative_path,
+                    doc_relative,
+                    row["sha256"],
+                    stored_analysis,
+                    row["reused_from"],
+                )
+            results.append(
+                result_record(
+                    row["status"],
+                    source,
+                    relative_path,
+                    str(doc_path),
+                    row["reused_from"],
+                )
+            )
+            continue
 
-            digest = sha256_file(source)
-            duplicate = connection.execute(
-                """
-                SELECT * FROM files
-                WHERE sha256 = ?
-                  AND relative_path <> ?
-                  AND status IN ('fresh', 'unsupported')
-                ORDER BY analyzed_at DESC
-                LIMIT 1
-                """,
-                (digest, relative_path),
-            ).fetchone()
-            reused_from: Optional[str] = None
-            if duplicate is not None:
-                analysis = analysis_from_row(duplicate)
-                reused_from = duplicate["relative_path"]
-            else:
-                analysis = analyze_file(source)
+        digest = sha256_file(source)
+        duplicate = connection.execute(
+            """
+            SELECT * FROM files
+            WHERE sha256 = ?
+              AND relative_path <> ?
+              AND status IN ('fresh', 'unsupported')
+            ORDER BY analyzed_at DESC
+            LIMIT 1
+            """,
+            (digest, relative_path),
+        ).fetchone()
+        if duplicate is not None:
+            reused_from = duplicate["relative_path"]
+            analysis = analysis_from_row(duplicate)
+            document = render_document(
+                task_root,
+                source,
+                relative_path,
+                digest,
+                analysis,
+                reused_from,
+            )
+            atomic_write_text(doc_path, document)
+            upsert_entry(
+                connection,
+                task_root,
+                source,
+                relative_path,
+                doc_relative,
+                digest,
+                analysis,
+                reused_from,
+            )
+            results.append(
+                result_record(
+                    analysis.status,
+                    source,
+                    relative_path,
+                    str(doc_path),
+                    reused_from,
+                )
+            )
+            continue
+        pending.append((source, relative_path, doc_relative, doc_path, digest))
 
+    # 第二阶段：同一批内按 SHA-256 分组复用，每组只解析第一个文件；
+    # 剩余文件在并行解析后按确定顺序写文档与索引。
+    try:
+        groups: Dict[str, List[Tuple[Path, str, str, Path]]] = {}
+        for source, relative_path, doc_relative, doc_path, digest in pending:
+            groups.setdefault(digest, []).append(
+                (source, relative_path, doc_relative, doc_path)
+            )
+        analyzed: Dict[str, Analysis] = {}
+        if groups:
+            workers = max(1, min(MAX_PARSE_WORKERS, os.cpu_count() or 1))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(analyze_file, entries[0][0]): digest
+                    for digest, entries in groups.items()
+                }
+                for future in futures:
+                    analyzed[futures[future]] = future.result()
+
+        for source, relative_path, doc_relative, doc_path, digest in pending:
+            group = groups[digest]
+            reused_from: Optional[str] = (
+                relative_key(group[0][0], task_root)
+                if group[0][1] != relative_path
+                else None
+            )
+            analysis = analyzed[digest]
             document = render_document(
                 task_root,
                 source,
@@ -1443,9 +2318,10 @@ def catalog_files(
 def lookup_files(
     task_root: Path,
     raw_paths: Sequence[str],
+    extra_excludes: Sequence[str] = (),
 ) -> List[Dict[str, str]]:
     catalog_root, _, database_path = catalog_paths(task_root)
-    candidates, issues, _ = gather_files(task_root, raw_paths)
+    candidates, issues, _ = gather_files(task_root, raw_paths, extra_excludes)
     connection = connect_database(database_path, create=False)
     results = list(issues)
     if connection is None:
@@ -1506,17 +2382,18 @@ def search_catalog(
     if connection is None:
         return []
     try:
-        pattern = f"%{query}%"
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
         rows = connection.execute(
             """
             SELECT relative_path, source_absolute, document_relative, status,
                    file_type, reused_from
             FROM files
-            WHERE relative_path LIKE ? COLLATE NOCASE
-               OR source_absolute LIKE ? COLLATE NOCASE
-               OR search_text LIKE ? COLLATE NOCASE
+            WHERE relative_path LIKE ? ESCAPE '\\' COLLATE NOCASE
+               OR source_absolute LIKE ? ESCAPE '\\' COLLATE NOCASE
+               OR search_text LIKE ? ESCAPE '\\' COLLATE NOCASE
             ORDER BY
-                CASE WHEN relative_path LIKE ? COLLATE NOCASE THEN 0 ELSE 1 END,
+                CASE WHEN relative_path LIKE ? ESCAPE '\\' COLLATE NOCASE THEN 0 ELSE 1 END,
                 lower(relative_path)
             LIMIT ?
             """,
@@ -1537,8 +2414,57 @@ def search_catalog(
         connection.close()
 
 
-def print_results(records: Sequence[Dict[str, str]], limit: int) -> None:
+def catalog_info(task_root: Path) -> List[Dict[str, Any]]:
+    """Summarize the task-local catalog: counts by status and format."""
+    catalog_root, _, database_path = catalog_paths(task_root)
+    connection = connect_database(database_path, create=False)
+    if connection is None:
+        return [{"catalog_exists": False}]
+    try:
+        status_counts = {
+            row["status"]: row["count"]
+            for row in connection.execute(
+                "SELECT status, count(*) AS count FROM files GROUP BY status"
+            ).fetchall()
+        }
+        format_counts = {
+            row["file_type"]: row["count"]
+            for row in connection.execute(
+                "SELECT file_type, count(*) AS count FROM files "
+                "GROUP BY file_type ORDER BY count(*) DESC LIMIT 20"
+            ).fetchall()
+        }
+        last_analyzed = connection.execute(
+            "SELECT max(analyzed_at) AS value FROM files"
+        ).fetchone()["value"]
+        return [
+            {
+                "catalog_exists": True,
+                "catalog_root": str(catalog_root),
+                "database": str(database_path),
+                "total_entries": sum(status_counts.values()),
+                "status_counts": status_counts,
+                "format_counts": format_counts,
+                "last_analyzed": last_analyzed,
+            }
+        ]
+    finally:
+        connection.close()
+
+
+def print_results(records: Sequence[Dict[str, Any]], limit: int, json_mode: bool) -> None:
     shown = list(records[:limit])
+    if json_mode:
+        payload = {
+            "results": shown,
+            "summary": {
+                "total": len(records),
+                "shown": len(shown),
+                "omitted": max(0, len(records) - len(shown)),
+            },
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
     for record in shown:
         parts = [
             f"status={record.get('status', '')}",
@@ -1550,6 +2476,8 @@ def print_results(records: Sequence[Dict[str, str]], limit: int) -> None:
             parts.append(f"document={record['document']}")
         if record.get("reused_from"):
             parts.append(f"reused_from={record['reused_from']}")
+        if record.get("catalog_exists") is not None and "path" not in record:
+            parts = [f"{key}={value}" for key, value in record.items()]
         print(" | ".join(parts))
     if len(records) > len(shown):
         print(f"... {len(records) - len(shown)} additional result(s) omitted by --limit")
@@ -1560,10 +2488,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create and reuse per-task structural explanations for local files."
     )
+
+    json_parent = argparse.ArgumentParser(add_help=False)
+    json_parent.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON instead of status lines.",
+    )
+    scan_parent = argparse.ArgumentParser(add_help=False, parents=[json_parent])
+    scan_parent.add_argument(
+        "--exclude",
+        default="",
+        help="Comma-separated file/directory names to skip during scans.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     catalog_parser = subparsers.add_parser(
-        "catalog", help="Catalog missing or stale task files."
+        "catalog", help="Catalog missing or stale task files.", parents=[scan_parent]
     )
     catalog_parser.add_argument(
         "--task-root", help="Large-task root; defaults to the current directory."
@@ -1578,7 +2519,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     lookup_parser = subparsers.add_parser(
-        "lookup", help="Check whether explanations are fresh."
+        "lookup", help="Check whether explanations are fresh.", parents=[scan_parent]
     )
     lookup_parser.add_argument(
         "--task-root", help="Large-task root; defaults to the current directory."
@@ -1591,7 +2532,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     search_parser = subparsers.add_parser(
-        "search", help="Search the current task's catalog."
+        "search", help="Search the current task's catalog.", parents=[json_parent]
     )
     search_parser.add_argument(
         "--task-root", help="Large-task root; defaults to the current directory."
@@ -1600,6 +2541,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=20, help="Maximum search results."
     )
     search_parser.add_argument("query", help="Path, name, format, field, or keyword.")
+
+    info_parser = subparsers.add_parser(
+        "info", help="Summarize the task-local catalog.", parents=[json_parent]
+    )
+    info_parser.add_argument(
+        "--task-root", help="Large-task root; defaults to the current directory."
+    )
+    info_parser.add_argument(
+        "--limit", type=int, default=20, help="Maximum listed formats."
+    )
     return parser
 
 
@@ -1615,13 +2566,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         task_root = resolve_task_root(args.task_root)
         limit = max(1, min(int(args.limit), 500))
+        excludes = [name for name in getattr(args, "exclude", "").split(",") if name.strip()]
         if args.command == "catalog":
-            records = catalog_files(task_root, args.paths)
+            records = catalog_files(task_root, args.paths, excludes)
         elif args.command == "lookup":
-            records = lookup_files(task_root, args.paths)
-        else:
+            records = lookup_files(task_root, args.paths, excludes)
+        elif args.command == "search":
             records = search_catalog(task_root, args.query, limit)
-        print_results(records, limit)
+        else:
+            records = catalog_info(task_root)
+        print_results(records, limit, json_mode=args.json)
         return 0
     except (OSError, ValueError, sqlite3.Error) as error:
         print(f"error={type(error).__name__}: {error}", file=sys.stderr)
