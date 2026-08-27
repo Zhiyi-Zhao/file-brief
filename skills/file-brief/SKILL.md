@@ -1,5 +1,5 @@
 ---
-name: catalog-input-files
+name: file-brief
 description: Catalog local task-folder input files into reusable Markdown explanations and a searchable per-task index. Use whenever a task involves reading, inspecting, analyzing, transforming, or writing code against one or more local files or directories in any language or format — delimited tables (CSV/TSV with delimiter auto-detection), Excel, Parquet/Feather, JSON/JSONL/YAML/TOML, SQLite databases, ZIP/TAR/GZIP archives, XML/HTML documents, Jupyter notebooks, Stata datasets, RDS/RData, source code in common languages, text, Markdown, PDF, DOCX, images, or unknown binary files. Check the task-local catalog before probing source files, and refresh only missing or stale entries.
 ---
 
@@ -74,9 +74,9 @@ Store both the task-relative path and the absolute path at scan time. Use the ta
 
 ## Platform Installation
 
-- OpenAI Codex: copy this folder to `<CODEX_HOME or ~/.codex>/skills/catalog-input-files`.
-- Claude Code: copy this folder to `~/.claude/skills/catalog-input-files`.
-- DeepSeek Harness: copy this folder to `~/.dsh/skills/catalog-input-files` or `~/.agents/skills/catalog-input-files` (project roots `.dsh/skills` and `.agents/skills` also work).
+- OpenAI Codex: copy this folder to `<CODEX_HOME or ~/.codex>/skills/file-brief`.
+- Claude Code: copy this folder to `~/.claude/skills/file-brief`.
+- DeepSeek Harness: copy this folder to `~/.dsh/skills/file-brief` or `~/.agents/skills/file-brief` (project roots `.dsh/skills` and `.agents/skills` also work).
 - Or run the repository's `install.ps1` / `install.sh` which installs to all configured agent homes.
 
 The Python entrypoint resolves its companion `inspect_r_data.R` automatically. It checks `R_SCRIPT_EXE`, then `Rscript` on `PATH`, then common Windows R installation directories.

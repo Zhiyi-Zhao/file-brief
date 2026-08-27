@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — Install the catalog-input-files skill into one or more agent
+# install.sh — Install the file-brief skill into one or more agent
 # skill homes (OpenAI Codex, Claude Code, DeepSeek Harness, shared ~/.agents).
 #
 # Usage (from the repository root):
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source_dir="$repository_root/skills/catalog-input-files"
+source_dir="$repository_root/skills/file-brief"
 
 if [[ ! -f "$source_dir/SKILL.md" ]]; then
   echo "error: skill source not found at $source_dir" >&2
@@ -34,7 +34,7 @@ agents_home="${DSH_AGENTS_HOME:-$HOME/.agents}"
 install_skill() {
   local destination_root="$1"
   local label="$2"
-  local destination="$destination_root/catalog-input-files"
+  local destination="$destination_root/file-brief"
   mkdir -p "$destination_root"
   rm -rf "$destination"
   cp -R "$source_dir" "$destination"

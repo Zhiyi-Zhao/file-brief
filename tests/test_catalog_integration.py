@@ -4,7 +4,7 @@
 ===============================================================================
 输入 / Inputs:
   - pytest 提供的临时目录；
-  - 仓库中的 skills/catalog-input-files 技能源码；
+  - 仓库中的 skills/file-brief 技能源码；
   - 可选的 Rscript + jsonlite，用于 RDS/RData 测试。
 
 输出 / Outputs:
@@ -55,7 +55,7 @@ from pypdf import PdfWriter
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SKILL_ROOT = REPOSITORY_ROOT / "skills" / "catalog-input-files"
+SKILL_ROOT = REPOSITORY_ROOT / "skills" / "file-brief"
 CATALOG_SCRIPT = SKILL_ROOT / "scripts" / "file_catalog.py"
 R_HELPER = SKILL_ROOT / "scripts" / "inspect_r_data.R"
 SECRET = "PRIVATE_" + "UNIQUE_VALUE_" + "94817"
@@ -525,7 +525,7 @@ def test_publication_hygiene() -> None:
     assert "name:" in skill_frontmatter
     assert "description:" in skill_frontmatter
     assert "metadata:" not in skill_frontmatter
-    assert "catalog-input-files" in skill_frontmatter
+    assert "file-brief" in skill_frontmatter
 
 
 def test_json_and_info_outputs(tmp_path: Path) -> None:

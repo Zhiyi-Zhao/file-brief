@@ -1,5 +1,5 @@
 # =============================================================================
-# install.ps1 — Install the catalog-input-files skill into one or more agent
+# install.ps1 — Install the file-brief skill into one or more agent
 # skill homes (OpenAI Codex, Claude Code, DeepSeek Harness, shared ~/.agents).
 #
 # Usage (from the repository root):
@@ -18,14 +18,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repositoryRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$source = Join-Path $repositoryRoot "skills\catalog-input-files"
+$source = Join-Path $repositoryRoot "skills\file-brief"
 if (-not (Test-Path -LiteralPath (Join-Path $source "SKILL.md"))) {
   Write-Error "Skill source not found at $source. Run this script from the repository root."
   exit 1
 }
 
 function Install-Skill($destinationRoot, [string]$label) {
-  $destination = Join-Path $destinationRoot "catalog-input-files"
+  $destination = Join-Path $destinationRoot "file-brief"
   New-Item -ItemType Directory -Path $destinationRoot -Force | Out-Null
   if (Test-Path -LiteralPath $destination) {
     Remove-Item -LiteralPath $destination -Recurse -Force

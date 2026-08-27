@@ -1,8 +1,8 @@
-# codex-catalog-input-files
+# file-brief
 
 [中文](#中文) · [English](#english)
 
-`catalog-input-files` is an agent-agnostic skill (OpenAI Codex · Claude Code · DeepSeek Harness) that turns repeated input-file inspection into reusable, task-local documentation.
+`file-brief` is an agent-agnostic skill (OpenAI Codex · Claude Code · DeepSeek Harness) that turns repeated input-file inspection into reusable, task-local documentation.
 
 ---
 
@@ -25,7 +25,7 @@
 2. **污染正式代码**：临时的 `head()`、`str()`、`read_csv()`、字段打印和调试逻辑容易留在最终脚本中。
 3. **难以复用知识**：即使同一文件在另一个任务或会话中再次使用，之前发现的数据结构通常没有被保存。
 
-这个仓库发布 `catalog-input-files` 技能，把上述检查集中为一个可复用的预检层。技能为每个大型任务维护独立的 `.file-catalog`，生成简洁的 Markdown 说明和 SQLite 检索索引。后续 Agent 可以先读取说明，只在文件新增或变化时重新解析。
+这个仓库发布 `file-brief` 技能，把上述检查集中为一个可复用的预检层。技能为每个大型任务维护独立的 `.file-catalog`，生成简洁的 Markdown 说明和 SQLite 检索索引。后续 Agent 可以先读取说明，只在文件新增或变化时重新解析。
 
 技能本身与具体 Agent 平台无关：任何能执行 Python 命令的 Agent（OpenAI Codex、Claude Code、DeepSeek Harness 等）都可以按同一工作流使用。
 
@@ -33,8 +33,8 @@
 
 | 平台 | 安装位置 | 说明 |
 |---|---|---|
-| OpenAI Codex | `<CODEX_HOME 或 ~/.codex>/skills/catalog-input-files` | 原生 skill 机制 |
-| Claude Code | `~/.claude/skills/catalog-input-files` | 原生 Agent Skills 机制 |
+| OpenAI Codex | `<CODEX_HOME 或 ~/.codex>/skills/file-brief` | 原生 skill 机制 |
+| Claude Code | `~/.claude/skills/file-brief` | 原生 Agent Skills 机制 |
 | DeepSeek Harness | `~/.dsh/skills/` 或 `~/.agents/skills/`（也可用项目内 `.dsh/skills`、`.agents/skills`） | 自动发现 `SKILL.md` |
 
 一键安装（在仓库根目录）：
@@ -55,12 +55,12 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ```powershell
 # Windows：DeepSeek Harness
-Copy-Item -LiteralPath ".\skills\catalog-input-files" -Destination "$HOME\.dsh\skills\catalog-input-files" -Recurse
+Copy-Item -LiteralPath ".\skills\file-brief" -Destination "$HOME\.dsh\skills\file-brief" -Recurse
 ```
 
 ```bash
 # macOS/Linux：Claude Code
-mkdir -p ~/.claude/skills && cp -R skills/catalog-input-files ~/.claude/skills/
+mkdir -p ~/.claude/skills && cp -R skills/file-brief ~/.claude/skills/
 ```
 
 安装后请启动一个新的 Agent 会话，使技能列表重新加载。
@@ -139,7 +139,7 @@ Rscript 的发现顺序是：
 
 ### 使用（与语言和平台无关）
 
-以下示例中的 `<skill-dir>` 是已安装的 `catalog-input-files` 技能目录。任何任务——数据分析、Web 项目、配置管线、迁移脚本——都遵循同一工作流。
+以下示例中的 `<skill-dir>` 是已安装的 `file-brief` 技能目录。任何任务——数据分析、Web 项目、配置管线、迁移脚本——都遵循同一工作流。
 
 #### 选择任务根目录
 
@@ -330,7 +330,7 @@ Those checks are necessary, but repeating them in every session creates three pr
 2. **Production code becomes noisy.** Temporary `head()`, `str()`, `read_csv()`, schema prints, and debugging logic leak into final scripts.
 3. **Knowledge is not reusable.** A later agent or session usually has to rediscover the same structure.
 
-This repository publishes the `catalog-input-files` skill as a reusable preflight layer. Each large task receives its own `.file-catalog` with concise Markdown explanations and a SQLite search index. Later agents can reuse those explanations and reparse only files that are new or stale.
+This repository publishes the `file-brief` skill as a reusable preflight layer. Each large task receives its own `.file-catalog` with concise Markdown explanations and a SQLite search index. Later agents can reuse those explanations and reparse only files that are new or stale.
 
 The skill is agent-platform agnostic: any agent that can execute Python commands — OpenAI Codex, Claude Code, DeepSeek Harness, and others — uses the same workflow.
 
@@ -338,8 +338,8 @@ The skill is agent-platform agnostic: any agent that can execute Python commands
 
 | Platform | Install location | Notes |
 |---|---|---|
-| OpenAI Codex | `<CODEX_HOME or ~/.codex>/skills/catalog-input-files` | Native skill mechanism |
-| Claude Code | `~/.claude/skills/catalog-input-files` | Native Agent Skills mechanism |
+| OpenAI Codex | `<CODEX_HOME or ~/.codex>/skills/file-brief` | Native skill mechanism |
+| Claude Code | `~/.claude/skills/file-brief` | Native Agent Skills mechanism |
 | DeepSeek Harness | `~/.dsh/skills/` or `~/.agents/skills/` (project `.dsh/skills` and `.agents/skills` also work) | Auto-discovers `SKILL.md` |
 
 One-shot install (from the repository root):
@@ -360,7 +360,7 @@ Manual copy also works:
 
 ```bash
 # macOS/Linux: Claude Code
-mkdir -p ~/.claude/skills && cp -R skills/catalog-input-files ~/.claude/skills/
+mkdir -p ~/.claude/skills && cp -R skills/file-brief ~/.claude/skills/
 ```
 
 Start a new agent session after installation so the skill list reloads.
@@ -437,7 +437,7 @@ Rscript is resolved from:
 
 ### Usage (language- and platform-agnostic)
 
-`<skill-dir>` below means the installed `catalog-input-files` skill directory. Any task — data analysis, a web project, a config pipeline, a migration script — follows the same workflow.
+`<skill-dir>` below means the installed `file-brief` skill directory. Any task — data analysis, a web project, a config pipeline, a migration script — follows the same workflow.
 
 #### Choose a task root
 

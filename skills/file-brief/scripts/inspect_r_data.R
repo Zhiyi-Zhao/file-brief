@@ -14,7 +14,7 @@
 #   失败时仍输出 status="error" 的 JSON，并以非零状态退出。
 #
 # 作用：
-#   为 catalog-input-files 技能提供稳定的 R 数据结构探查能力，使 Agent 不必在每个
+#   为 file-brief 技能提供稳定的 R 数据结构探查能力，使 Agent 不必在每个
 #   分析任务中重复编写 readRDS()/load()/str() 等一次性检查代码。
 #
 # 设计逻辑：
