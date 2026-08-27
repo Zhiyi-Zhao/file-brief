@@ -1,9 +1,18 @@
 {
   "name": "file-brief",
   "version": "2.0.0",
-  "description": "Agent-agnostic skill that catalogs task input files into reusable structural explanations and a per-task searchable index (OpenAI Codex, Claude Code, DeepSeek Harness)",
+  "description": "Agent-agnostic skill that turns task input files into reusable structural briefs and a per-task searchable index (OpenAI Codex, Claude Code, DeepSeek Harness)",
   "type": "module",
   "license": "MIT",
+  "author": "Zhiyi Zhao <zhiyi1.zhao@wur.nl>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zhiyi-Zhao/file-brief.git"
+  },
+  "homepage": "https://github.com/Zhiyi-Zhao/file-brief",
+  "bugs": {
+    "url": "https://github.com/Zhiyi-Zhao/file-brief/issues"
+  },
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
@@ -11,11 +20,18 @@
     "codex",
     "claude-code",
     "file-catalog",
-    "data-analysis"
+    "data-analysis",
+    "preflight"
   ],
   "files": [
-    "skills/"
+    "skills/",
+    "cordis.patch.yml",
+    "install.ps1",
+    "install.sh"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

@@ -1,0 +1,6 @@
+# npm package exclusions: keep the published tarball clean.
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/.DS_Store
+**/*.log
