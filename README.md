@@ -2,6 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/file-brief)](https://www.npmjs.com/package/file-brief)
 [![npm downloads](https://img.shields.io/npm/dm/file-brief)](https://www.npmjs.com/package/file-brief)
+[![DSH Market](https://raw.githubusercontent.com/2BingLing/dsh-market/master/assets/readme/badge-listed-en.svg)](https://dsh.market/?q=Zhiyi-Zhao%2Ffile-brief)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Zhiyi-Zhao/file-brief/actions/workflows/validate.yml/badge.svg)](https://github.com/Zhiyi-Zhao/file-brief/actions/workflows/validate.yml)
 
