@@ -1,6 +1,6 @@
 {
   "name": "file-brief",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Agent-agnostic skill that turns task input files into reusable structural briefs and a per-task searchable index (OpenAI Codex, Claude Code, DeepSeek Harness)",
   "type": "module",
   "license": "MIT",
@@ -14,6 +14,7 @@
     "url": "https://github.com/Zhiyi-Zhao/file-brief/issues"
   },
   "keywords": [
+    "dsh",
     "dsh-plugin",
     "deepseek-harness",
     "skill",
